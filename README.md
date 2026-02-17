@@ -58,6 +58,17 @@ $script:GitFileVerPickerPath = "P:\Resources\Scripts\Git-Version-Picker\GitFileV
 - Long paths (e.g. over 260 characters) or permission-denied folders may cause errors or skipped content.
 - There is no cancel button during a scan (future improvement).
 
+## Tests
+
+Core logic is in `Find-DeformedUAssetsCore.ps1` (dot-sourced by the main script). Pester tests live in `find-deformed-uassets.Tests.ps1`.
+
+```powershell
+# Run all tests (requires Pester, e.g. Install-Module Pester -Scope CurrentUser)
+Invoke-Pester -Script .\find-deformed-uassets.Tests.ps1
+```
+
+Tests cover: `Find-BytesInBuffer`, `Test-UAssetMagicHeader`, `Test-FileHasConflictMarkers`, `Get-UAssetHealth`, and `Invoke-ScanUAssets` (including size filter and excluded paths).
+
 ## Requirements
 
 - PowerShell (Windows).

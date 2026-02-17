@@ -12,6 +12,13 @@ $script:ConflictMarkerHead = [System.Text.Encoding]::ASCII.GetBytes("<<<<<<<")
 $script:ConflictMarkerSep = [System.Text.Encoding]::ASCII.GetBytes("=======")
 $script:ConflictMarkerEnd = [System.Text.Encoding]::ASCII.GetBytes(">>>>>>>")
 
+# Prefer grep (e.g. Git for Windows) or ripgrep for conflict-marker search; fallback = byte scan
+$script:GrepPath = $null
+foreach ($cmd in @('grep', 'rg')) {
+    $exe = Get-Command $cmd -ErrorAction SilentlyContinue
+    if ($exe) { $script:GrepPath = $exe.Source; break }
+}
+
 # Only scan .uasset files at or below this size (bytes). Use filesystem metadata so large trees stay fast.
 $script:MaxUAssetSizeBytes = 3072   # 3KB
 
@@ -101,6 +108,48 @@ function Find-BytesInBuffer {
     return $false
 }
 
+# Returns true if file contains any Git conflict marker (<<<<<<<, =======, >>>>>>>). Uses grep/rg when available.
+function Test-FileHasConflictMarkers {
+    param ([string]$FilePath)
+
+    if (-not $FilePath -or -not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+        return $false
+    }
+
+    if ($script:GrepPath) {
+        try {
+            $proc = Start-Process -FilePath $script:GrepPath -ArgumentList @('-a', '-q', '-F', '-e', '<<<<<<<', '-e', '=======', '-e', '>>>>>>>', '--', $FilePath) -PassThru -NoNewWindow -Wait
+            return ($proc.ExitCode -eq 0)
+        } catch {
+            return $false
+        }
+    }
+
+    # Fallback: byte scan (same logic as before)
+    try {
+        $stream = [System.IO.File]::OpenRead($FilePath)
+        try {
+            $headerSize = [Math]::Min(8192, $stream.Length)
+            $buffer = New-Object byte[] $headerSize
+            $read = $stream.Read($buffer, 0, $headerSize)
+            $fullBuffer = $buffer[0..($read - 1)]
+            if ($stream.Length -gt $headerSize -and $stream.Length -lt 1024 * 1024) {
+                $rest = New-Object byte[] ($stream.Length - $read)
+                $stream.Read($rest, 0, $rest.Length) | Out-Null
+                $fullBuffer = $fullBuffer + $rest
+            }
+            $hasHead = Find-BytesInBuffer -Buffer $fullBuffer -Search $script:ConflictMarkerHead
+            $hasSep  = Find-BytesInBuffer -Buffer $fullBuffer -Search $script:ConflictMarkerSep
+            $hasEnd  = Find-BytesInBuffer -Buffer $fullBuffer -Search $script:ConflictMarkerEnd
+            return ($hasHead -or $hasSep -or $hasEnd)
+        } finally {
+            $stream.Close()
+        }
+    } catch {
+        return $false
+    }
+}
+
 # Returns true if file starts with UAsset magic bytes
 function Test-UAssetMagicHeader {
     param ([byte[]]$Header)
@@ -154,36 +203,20 @@ function Get-UAssetHealth {
         }
     }
 
+    # Conflict markers: use grep/rg when available, else byte scan
+    if (Test-FileHasConflictMarkers -FilePath $FullPath) {
+        $result.Status = "Deformed"
+        $result.Reason = "Git merge conflict markers (<<<<<<< / ======= / >>>>>>>)"
+        $result.Deformed = $true
+        return $result
+    }
+
     try {
         $stream = [System.IO.File]::OpenRead($FullPath)
         try {
-            $headerSize = [Math]::Min(8192, $stream.Length)  # Read first 8KB for conflict markers and magic
+            $headerSize = [Math]::Min(8192, $stream.Length)
             $buffer = New-Object byte[] $headerSize
-            $read = $stream.Read($buffer, 0, $headerSize)
-
-            # If file is small, read rest for conflict markers (merge text can be at end)
-            if ($stream.Length -gt $headerSize -and $stream.Length -lt 1024 * 1024) {
-                $rest = New-Object byte[] ($stream.Length - $read)
-                $stream.Read($rest, 0, $rest.Length) | Out-Null
-                $fullBuffer = $buffer[0..($read - 1)] + $rest
-            } else {
-                $fullBuffer = $buffer[0..($read - 1)]
-            }
-
-            $hasConflictHead = Find-BytesInBuffer -Buffer $fullBuffer -Search $script:ConflictMarkerHead
-            $hasConflictSep  = Find-BytesInBuffer -Buffer $fullBuffer -Search $script:ConflictMarkerSep
-            $hasConflictEnd  = Find-BytesInBuffer -Buffer $fullBuffer -Search $script:ConflictMarkerEnd
-
-            if ($hasConflictHead -or $hasConflictSep -or $hasConflictEnd) {
-                $result.Status = "Deformed"
-                $reasons = @()
-                if ($hasConflictHead) { $reasons += "contains <<<<<<<" }
-                if ($hasConflictSep)  { $reasons += "contains ======= " }
-                if ($hasConflictEnd)  { $reasons += "contains >>>>>>>" }
-                $result.Reason = "Git merge conflict markers: " + ($reasons -join "; ")
-                $result.Deformed = $true
-                return $result
-            }
+            [void]$stream.Read($buffer, 0, $headerSize)
 
             $hasValidMagic = Test-UAssetMagicHeader -Header $buffer
             if (-not $hasValidMagic) {
@@ -291,10 +324,10 @@ $scanButton.Add_Click({
         [System.Windows.MessageBox]::Show("Folder does not exist: $folder", "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
         return
     }
-    $statusText.Text = "Scanning..."
+    $statusText.Text = "Step 1: Preparing scan..."
     $statusText.Foreground = [System.Windows.Media.Brushes]::Orange
 
-    $progressSync = [hashtable]::Synchronized(@{ Count = 0; Total = 0 })
+    $progressSync = [hashtable]::Synchronized(@{ Count = 0; Total = 0; Phase = "Preparing" })
     $runspace = [runspacefactory]::CreateRunspace()
     $runspace.ApartmentState = "STA"
     $runspace.Open()
@@ -307,6 +340,7 @@ $scanButton.Add_Click({
     $runspace.SessionStateProxy.SetVariable("MaxUAssetSizeBytes", $script:MaxUAssetSizeBytes)
     $runspace.SessionStateProxy.SetVariable("ProgressSync", $progressSync)
     $runspace.SessionStateProxy.SetVariable("LogPath", $script:ScanLogPath)
+    $runspace.SessionStateProxy.SetVariable("GrepPath", $script:GrepPath)
 
     $scriptBlock = {
         function Find-BytesInBuffer { param([byte[]]$Buffer,[byte[]]$Search)
@@ -318,15 +352,43 @@ $scanButton.Add_Click({
             }
             return $false
         }
+        function Test-FileHasConflictMarkersRunspace { param([string]$Path)
+            if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+            if ($GrepPath) {
+                try {
+                    $proc = Start-Process -FilePath $GrepPath -ArgumentList @('-a', '-q', '-F', '-e', '<<<<<<<', '-e', '=======', '-e', '>>>>>>>', '--', $Path) -PassThru -NoNewWindow -Wait
+                    return ($proc.ExitCode -eq 0)
+                } catch { return $false }
+                }
+            try {
+                $stream = [System.IO.File]::OpenRead($Path)
+                try {
+                    $headerSize = [Math]::Min(8192, $stream.Length)
+                    $buffer = New-Object byte[] $headerSize
+                    $read = $stream.Read($buffer, 0, $headerSize)
+                    $fullBuffer = $buffer
+                    if ($stream.Length -gt $headerSize -and $stream.Length -lt 1048576) {
+                        $rest = New-Object byte[] ($stream.Length - $headerSize)
+                        [void]$stream.Read($rest, 0, $rest.Length)
+                        $fullBuffer = $buffer + $rest
+                    }
+                    $stream.Close()
+                    return (Find-BytesInBuffer $fullBuffer $ConflictMarkerHead -or Find-BytesInBuffer $fullBuffer $ConflictMarkerSep -or Find-BytesInBuffer $fullBuffer $ConflictMarkerEnd)
+                } finally { $stream.Close() }
+            } catch { return $false }
+        }
         function Test-UAssetMagicHeader { param([byte[]]$Header)
             if ($null -eq $Header -or $Header.Length -lt $UAssetMagicBytes.Length) { return $false }
             for ($i = 0; $i -lt $UAssetMagicBytes.Length; $i++) { if ($Header[$i] -ne $UAssetMagicBytes[$i]) { return $false } }
             return $true
         }
+        $ProgressSync.Phase = "Step 2: Finding git root..."
         $gitRoot = $null
         try { Push-Location $RootPath; $gitRoot = (git rev-parse --show-toplevel 2>$null); Pop-Location } catch { Pop-Location -ErrorAction SilentlyContinue }
+        $ProgressSync.Phase = "Step 3: Enumerating .uasset files (under 3KB)..."
         $rootAbs = [System.IO.Path]::GetFullPath($RootPath)
         $files = @(Get-ChildItem -Path $RootPath -Filter "*.uasset" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\Intermediate\\' -and $_.FullName -notmatch '\\Saved\\' -and $_.Length -le $MaxUAssetSizeBytes })
+        $ProgressSync.Phase = "Step 4: Scanning files..."
         $ProgressSync.Total = $files.Count
         $ProgressSync.Count = 0
         $logWriter = $null
@@ -343,21 +405,15 @@ $scanButton.Add_Click({
                     } catch { }
                 }
                 try {
-                    $stream = [System.IO.File]::OpenRead($file.FullName)
-                    $headerSize = [Math]::Min(8192, $stream.Length)
-                    $buffer = New-Object byte[] $headerSize
-                    [void]$stream.Read($buffer, 0, $headerSize)
-                    $fullBuffer = $buffer
-                    if ($stream.Length -gt $headerSize -and $stream.Length -lt 1048576) {
-                        $rest = New-Object byte[] ($stream.Length - $headerSize)
-                        [void]$stream.Read($rest, 0, $rest.Length)
-                        $fullBuffer = $buffer + $rest
+                    if (Test-FileHasConflictMarkersRunspace $file.FullName) { $status = "Deformed"; $reason = "Git conflict markers (grep)"; $deformed = $true }
+                    else {
+                        $stream = [System.IO.File]::OpenRead($file.FullName)
+                        $headerSize = [Math]::Min(8192, $stream.Length)
+                        $buffer = New-Object byte[] $headerSize
+                        [void]$stream.Read($buffer, 0, $headerSize)
+                        $stream.Close()
+                        if (-not (Test-UAssetMagicHeader $buffer)) { $status = "Deformed"; $reason = "Invalid UAsset header"; $deformed = $true }
                     }
-                    $stream.Close()
-                    if (Find-BytesInBuffer $fullBuffer $ConflictMarkerHead) { $status = "Deformed"; $reason = "Git conflict: <<<<<<<"; $deformed = $true }
-                    elseif (Find-BytesInBuffer $fullBuffer $ConflictMarkerSep) { $status = "Deformed"; $reason = "Git conflict: ======= "; $deformed = $true }
-                    elseif (Find-BytesInBuffer $fullBuffer $ConflictMarkerEnd) { $status = "Deformed"; $reason = "Git conflict: >>>>>>>"; $deformed = $true }
-                    elseif (-not (Test-UAssetMagicHeader $buffer)) { $status = "Deformed"; $reason = "Invalid UAsset header"; $deformed = $true }
                 } catch { $status = "Error"; $reason = $_.Exception.Message; $deformed = $true }
                 $null = $results.Add([PSCustomObject]@{ FullPath = $file.FullName; RelativePath = $rel; Status = $status; Reason = $reason; FileSize = $size; InGit = $inGit; Deformed = $deformed })
                 if ($logWriter) { try { $logWriter.WriteLine("$status`t$rel") } catch { } }
@@ -388,19 +444,24 @@ $scanButton.Add_Click({
                 $totalCount = $output[2]
                 $resultsGrid.ItemsSource = $items
                 $logNote = if ($script:ScanLogPath -and (Test-Path -LiteralPath $script:ScanLogPath)) { " Log: $script:ScanLogPath" } else { "" }
-                $statusText.Text = "Found $totalCount .uasset file(s) under 3KB. Deformed: $deformedCount$logNote"
+                $statusText.Text = "Step 5: Done. Found $totalCount .uasset file(s) under 3KB. Deformed: $deformedCount$logNote"
                 $statusText.Foreground = if ($deformedCount -gt 0) { [System.Windows.Media.Brushes]::Red } else { [System.Windows.Media.Brushes]::Green }
             } catch {
                 $statusText.Text = "Scan failed."
                 $statusText.Foreground = [System.Windows.Media.Brushes]::Red
                 [System.Windows.MessageBox]::Show($_.Exception.Message, "Scan Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
-            } finally {
-                $ps.Dispose(); $runspace.Close()
-            }
-            return
+        } finally {
+            $ps.Dispose(); $runspace.Close()
         }
+        return
+        }
+        $phase = $progressSync.Phase
         $c = $progressSync.Count; $t = $progressSync.Total
-        $statusText.Text = "Scanning... ($c / $t)"
+        if ($phase -match "Step 4" -and $t -gt 0) {
+            $statusText.Text = "$phase ($c / $t)"
+        } else {
+            $statusText.Text = $phase
+        }
     })
     $timer.Start()
 })
@@ -435,9 +496,9 @@ $refreshButton.Add_Click({
         [System.Windows.MessageBox]::Show("Folder does not exist: $folder", "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
         return
     }
-    $statusText.Text = "Scanning..."
+    $statusText.Text = "Step 1: Preparing scan..."
     $statusText.Foreground = [System.Windows.Media.Brushes]::Orange
-    $progressSync = [hashtable]::Synchronized(@{ Count = 0; Total = 0 })
+    $progressSync = [hashtable]::Synchronized(@{ Count = 0; Total = 0; Phase = "Preparing" })
     $runspace = [runspacefactory]::CreateRunspace()
     $runspace.ApartmentState = "STA"
     $runspace.Open()
@@ -450,6 +511,7 @@ $refreshButton.Add_Click({
     $runspace.SessionStateProxy.SetVariable("MaxUAssetSizeBytes", $script:MaxUAssetSizeBytes)
     $runspace.SessionStateProxy.SetVariable("ProgressSync", $progressSync)
     $runspace.SessionStateProxy.SetVariable("LogPath", $script:ScanLogPath)
+    $runspace.SessionStateProxy.SetVariable("GrepPath", $script:GrepPath)
     $scriptBlock = {
         function Find-BytesInBuffer { param([byte[]]$Buffer,[byte[]]$Search)
             if ($null -eq $Buffer -or $null -eq $Search -or $Search.Length -eq 0 -or $Buffer.Length -lt $Search.Length) { return $false }
@@ -460,15 +522,43 @@ $refreshButton.Add_Click({
             }
             return $false
         }
+        function Test-FileHasConflictMarkersRunspace { param([string]$Path)
+            if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+            if ($GrepPath) {
+                try {
+                    $proc = Start-Process -FilePath $GrepPath -ArgumentList @('-a', '-q', '-F', '-e', '<<<<<<<', '-e', '=======', '-e', '>>>>>>>', '--', $Path) -PassThru -NoNewWindow -Wait
+                    return ($proc.ExitCode -eq 0)
+                } catch { return $false }
+                }
+            try {
+                $stream = [System.IO.File]::OpenRead($Path)
+                try {
+                    $headerSize = [Math]::Min(8192, $stream.Length)
+                    $buffer = New-Object byte[] $headerSize
+                    $read = $stream.Read($buffer, 0, $headerSize)
+                    $fullBuffer = $buffer
+                    if ($stream.Length -gt $headerSize -and $stream.Length -lt 1048576) {
+                        $rest = New-Object byte[] ($stream.Length - $headerSize)
+                        [void]$stream.Read($rest, 0, $rest.Length)
+                        $fullBuffer = $buffer + $rest
+                    }
+                    $stream.Close()
+                    return (Find-BytesInBuffer $fullBuffer $ConflictMarkerHead -or Find-BytesInBuffer $fullBuffer $ConflictMarkerSep -or Find-BytesInBuffer $fullBuffer $ConflictMarkerEnd)
+                } finally { $stream.Close() }
+            } catch { return $false }
+        }
         function Test-UAssetMagicHeader { param([byte[]]$Header)
             if ($null -eq $Header -or $Header.Length -lt $UAssetMagicBytes.Length) { return $false }
             for ($i = 0; $i -lt $UAssetMagicBytes.Length; $i++) { if ($Header[$i] -ne $UAssetMagicBytes[$i]) { return $false } }
             return $true
         }
+        $ProgressSync.Phase = "Step 2: Finding git root..."
         $gitRoot = $null
         try { Push-Location $RootPath; $gitRoot = (git rev-parse --show-toplevel 2>$null); Pop-Location } catch { Pop-Location -ErrorAction SilentlyContinue }
+        $ProgressSync.Phase = "Step 3: Enumerating .uasset files (under 3KB)..."
         $rootAbs = [System.IO.Path]::GetFullPath($RootPath)
         $files = @(Get-ChildItem -Path $RootPath -Filter "*.uasset" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\Intermediate\\' -and $_.FullName -notmatch '\\Saved\\' -and $_.Length -le $MaxUAssetSizeBytes })
+        $ProgressSync.Phase = "Step 4: Scanning files..."
         $ProgressSync.Total = $files.Count
         $ProgressSync.Count = 0
         $logWriter = $null
@@ -485,21 +575,15 @@ $refreshButton.Add_Click({
                     } catch { }
                 }
                 try {
-                    $stream = [System.IO.File]::OpenRead($file.FullName)
-                    $headerSize = [Math]::Min(8192, $stream.Length)
-                    $buffer = New-Object byte[] $headerSize
-                    [void]$stream.Read($buffer, 0, $headerSize)
-                    $fullBuffer = $buffer
-                    if ($stream.Length -gt $headerSize -and $stream.Length -lt 1048576) {
-                        $rest = New-Object byte[] ($stream.Length - $headerSize)
-                        [void]$stream.Read($rest, 0, $rest.Length)
-                        $fullBuffer = $buffer + $rest
+                    if (Test-FileHasConflictMarkersRunspace $file.FullName) { $status = "Deformed"; $reason = "Git conflict markers (grep)"; $deformed = $true }
+                    else {
+                        $stream = [System.IO.File]::OpenRead($file.FullName)
+                        $headerSize = [Math]::Min(8192, $stream.Length)
+                        $buffer = New-Object byte[] $headerSize
+                        [void]$stream.Read($buffer, 0, $headerSize)
+                        $stream.Close()
+                        if (-not (Test-UAssetMagicHeader $buffer)) { $status = "Deformed"; $reason = "Invalid UAsset header"; $deformed = $true }
                     }
-                    $stream.Close()
-                    if (Find-BytesInBuffer $fullBuffer $ConflictMarkerHead) { $status = "Deformed"; $reason = "Git conflict: <<<<<<<"; $deformed = $true }
-                    elseif (Find-BytesInBuffer $fullBuffer $ConflictMarkerSep) { $status = "Deformed"; $reason = "Git conflict: ======= "; $deformed = $true }
-                    elseif (Find-BytesInBuffer $fullBuffer $ConflictMarkerEnd) { $status = "Deformed"; $reason = "Git conflict: >>>>>>>"; $deformed = $true }
-                    elseif (-not (Test-UAssetMagicHeader $buffer)) { $status = "Deformed"; $reason = "Invalid UAsset header"; $deformed = $true }
                 } catch { $status = "Error"; $reason = $_.Exception.Message; $deformed = $true }
                 $null = $results.Add([PSCustomObject]@{ FullPath = $file.FullName; RelativePath = $rel; Status = $status; Reason = $reason; FileSize = $size; InGit = $inGit; Deformed = $deformed })
                 if ($logWriter) { try { $logWriter.WriteLine("$status`t$rel") } catch { } }
@@ -525,7 +609,7 @@ $refreshButton.Add_Click({
                 $output = $ps.EndInvoke($async)
                 $resultsGrid.ItemsSource = $output[0]
                 $logNote = if ($script:ScanLogPath -and (Test-Path -LiteralPath $script:ScanLogPath)) { " Log: $script:ScanLogPath" } else { "" }
-                $statusText.Text = "Found $($output[2]) .uasset file(s) under 3KB. Deformed: $($output[1])$logNote"
+                $statusText.Text = "Step 5: Done. Found $($output[2]) .uasset file(s) under 3KB. Deformed: $($output[1])$logNote"
                 $statusText.Foreground = if ($output[1] -gt 0) { [System.Windows.Media.Brushes]::Red } else { [System.Windows.Media.Brushes]::Green }
             } catch {
                 $statusText.Text = "Scan failed."
@@ -536,8 +620,13 @@ $refreshButton.Add_Click({
             }
             return
         }
+        $phase = $progressSync.Phase
         $c = $progressSync.Count; $t = $progressSync.Total
-        $statusText.Text = "Scanning... ($c / $t)"
+        if ($phase -match "Step 4" -and $t -gt 0) {
+            $statusText.Text = "$phase ($c / $t)"
+        } else {
+            $statusText.Text = $phase
+        }
     })
     $timer.Start()
 })

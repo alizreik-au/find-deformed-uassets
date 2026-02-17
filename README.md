@@ -51,6 +51,7 @@ $script:GitFileVerPickerPath = "P:\Resources\Scripts\Git-Version-Picker\GitFileV
 
 - While scanning, the status bar shows **progress**: e.g. `Scanning... (150 / 500)`.
 - Each run writes a **log file** (one line per file: status and relative path). Default path: `%TEMP%\find-deformed-uassets-ScanLog.txt`. When the scan finishes, the status line includes `Log: <path>` so you can open or copy it. To disable logging, set `$script:ScanLogPath = ""` at the top of the script.
+- **Debug log**: Each scan also appends to `%TEMP%\find-deformed-uassets-debug.log` (timestamps, steps, runspace progress, and any errors). Use this if the UI seems to do nothing or status text vanishes. Set `$script:DebugLogPath = ""` to disable.
 
 ## Limitations
 

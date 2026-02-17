@@ -10,6 +10,17 @@ $script:ScanRoot = if ($args[0]) { $args[0] } else { Get-Location | Select-Objec
 # Scan log path (written during each scan; overwritten per run). Empty = no log file.
 $script:ScanLogPath = Join-Path $env:TEMP "find-deformed-uassets-ScanLog.txt"
 
+# Debug log (append; always written when scan runs). Set to "" to disable.
+$script:DebugLogPath = Join-Path $env:TEMP "find-deformed-uassets-debug.log"
+function Write-DebugLog {
+    param([string]$Message)
+    if (-not $script:DebugLogPath) { return }
+    try {
+        $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] $Message"
+        Add-Content -LiteralPath $script:DebugLogPath -Value $line -ErrorAction Stop
+    } catch { }
+}
+
 # Path to Git Version Picker script. Set to your GitFileVerPicker.ps1 location if not sibling folder.
 $script:GitFileVerPickerPath = Join-Path (Split-Path -Path $PSCommandPath -Parent) "..\Git-Version-Picker\GitFileVerPicker.ps1"
 # Alternative: $script:GitFileVerPickerPath = "P:\Resources\Scripts\Git-Version-Picker\GitFileVerPicker.ps1"
@@ -96,11 +107,16 @@ function Update-ScanResults {
     $totalCount = $items.Count
 
     $Grid.ItemsSource = $items
-    $StatusControl.Text = "Found $totalCount .uasset file(s) under 3KB. Deformed: $deformedCount"
-    $StatusControl.Foreground = if ($deformedCount -gt 0) {
-        [System.Windows.Media.Brushes]::Red
+    if ($totalCount -eq 0) {
+        $StatusControl.Text = "No .uasset files (under 3KB) found - folder was searched recursively."
+        $StatusControl.Foreground = [System.Windows.Media.Brushes]::Gray
     } else {
-        [System.Windows.Media.Brushes]::Green
+        $StatusControl.Text = "Found $totalCount .uasset file(s) under 3KB (searched recursively). Deformed: $deformedCount"
+        $StatusControl.Foreground = if ($deformedCount -gt 0) {
+            [System.Windows.Media.Brushes]::Red
+        } else {
+            [System.Windows.Media.Brushes]::Green
+        }
     }
 }
 
@@ -118,19 +134,24 @@ $browseButton.Add_Click({
 # Scan button (runs scan and updates grid)
 $scanButton.Add_Click({
     $folder = $folderPathBox.Text.Trim()
+    Write-DebugLog "Scan clicked. Folder: [$folder]"
     if (-not [System.IO.Directory]::Exists($folder)) {
+        Write-DebugLog "Scan aborted: folder does not exist"
         [System.Windows.MessageBox]::Show("Folder does not exist: $folder", "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
         return
     }
     $statusText.Text = "Step 1: Preparing scan..."
     $statusText.Foreground = [System.Windows.Media.Brushes]::Orange
+    Write-DebugLog "Step 1: Preparing scan..."
 
     $progressSync = [hashtable]::Synchronized(@{ Count = 0; Total = 0; Phase = "Preparing" })
     $runspace = [runspacefactory]::CreateRunspace()
     $runspace.ApartmentState = "STA"
     $runspace.Open()
+    Write-DebugLog "Runspace opened"
     $runspace.SessionStateProxy.Path.SetLocation($folder) | Out-Null
     $runspace.SessionStateProxy.SetVariable("RootPath", $folder)
+    $runspace.SessionStateProxy.SetVariable("DebugLogPath", $script:DebugLogPath)
     $runspace.SessionStateProxy.SetVariable("UAssetMagicBytes", $script:UAssetMagicBytes)
     $runspace.SessionStateProxy.SetVariable("ConflictMarkerHead", $script:ConflictMarkerHead)
     $runspace.SessionStateProxy.SetVariable("ConflictMarkerSep", $script:ConflictMarkerSep)
@@ -180,12 +201,12 @@ $scanButton.Add_Click({
             for ($i = 0; $i -lt $UAssetMagicBytes.Length; $i++) { if ($Header[$i] -ne $UAssetMagicBytes[$i]) { return $false } }
             return $true
         }
-        $ProgressSync.Phase = "Step 2: Finding git root..."
-        $gitRoot = $null
-        try { Push-Location $RootPath; $gitRoot = (git rev-parse --show-toplevel 2>$null); Pop-Location } catch { Pop-Location -ErrorAction SilentlyContinue }
-        $ProgressSync.Phase = "Step 3: Enumerating .uasset files (under 3KB)..."
+        $ProgressSync.Phase = "Step 2: Resolving path and finding git root..."
         $rootAbs = [System.IO.Path]::GetFullPath($RootPath)
-        $files = @(Get-ChildItem -Path $RootPath -Filter "*.uasset" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\Intermediate\\' -and $_.FullName -notmatch '\\Saved\\' -and $_.Length -le $MaxUAssetSizeBytes })
+        $gitRoot = $null
+        try { Push-Location -LiteralPath $rootAbs; $gitRoot = (git rev-parse --show-toplevel 2>$null); Pop-Location } catch { Pop-Location -ErrorAction SilentlyContinue }
+        $ProgressSync.Phase = "Step 3: Enumerating .uasset files recursively (under 3KB)..."
+        $files = @(Get-ChildItem -LiteralPath $rootAbs -Filter "*.uasset" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\Intermediate\\' -and $_.FullName -notmatch '\\Saved\\' -and $_.Length -le $MaxUAssetSizeBytes })
         $ProgressSync.Phase = "Step 4: Scanning files..."
         $ProgressSync.Total = $files.Count
         $ProgressSync.Count = 0
@@ -223,38 +244,54 @@ $scanButton.Add_Click({
             $ProgressSync.Count = $results.Count
         }
         if ($logWriter) { try { $logWriter.WriteLine("Scan finished at $(Get-Date -Format 'o')"); $logWriter.Close(); $logWriter.Dispose() } catch { } }
+        DLog "Runspace done. results.Count=$($results.Count)"
         return @(,$results), ($results | Where-Object Deformed).Count, (@($files).Count)
     }
 
     $ps = [powershell]::Create().AddScript($scriptBlock)
     $ps.Runspace = $runspace
+    Write-DebugLog "Calling BeginInvoke..."
     $async = $ps.BeginInvoke()
+    Write-DebugLog "BeginInvoke returned, starting timer"
 
     $timer = New-Object System.Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromMilliseconds(200)
     $timer.Add_Tick({
+        $phase = $progressSync.Phase
+        $c = $progressSync.Count; $t = $progressSync.Total
+        Write-DebugLog "Tick: IsCompleted=$($async.IsCompleted) Phase=$phase Count=$c Total=$t"
         if ($async.IsCompleted) {
             $timer.Stop()
+            Write-DebugLog "Async completed, calling EndInvoke..."
             try {
                 $output = $ps.EndInvoke($async)
                 $items = $output[0]
                 $deformedCount = $output[1]
                 $totalCount = $output[2]
+                Write-DebugLog "EndInvoke OK. totalCount=$totalCount deformedCount=$deformedCount"
                 $resultsGrid.ItemsSource = $items
                 $logNote = if ($script:ScanLogPath -and (Test-Path -LiteralPath $script:ScanLogPath)) { " Log: $script:ScanLogPath" } else { "" }
-                $statusText.Text = "Step 5: Done. Found $totalCount .uasset file(s) under 3KB. Deformed: $deformedCount$logNote"
-                $statusText.Foreground = if ($deformedCount -gt 0) { [System.Windows.Media.Brushes]::Red } else { [System.Windows.Media.Brushes]::Green }
+                if ($totalCount -eq 0) {
+                    $statusText.Text = "Done. No .uasset files (under 3KB) found - folder was searched recursively.$logNote"
+                    $statusText.Foreground = [System.Windows.Media.Brushes]::Gray
+                    Write-DebugLog "Status set (0 files). Showing MessageBox."
+                    [System.Windows.MessageBox]::Show("Scan complete. No .uasset files (under 3KB) were found in the selected folder or its subfolders. Only files under 3KB are scanned.", "Nothing found", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                } else {
+                    $statusText.Text = "Step 5: Done. Found $totalCount .uasset file(s) under 3KB (searched recursively). Deformed: $deformedCount$logNote"
+                    $statusText.Foreground = if ($deformedCount -gt 0) { [System.Windows.Media.Brushes]::Red } else { [System.Windows.Media.Brushes]::Green }
+                    Write-DebugLog "Status set ($totalCount files, $deformedCount deformed)."
+                }
             } catch {
+                Write-DebugLog "EndInvoke threw: $($_.Exception.Message)"
                 $statusText.Text = "Scan failed."
                 $statusText.Foreground = [System.Windows.Media.Brushes]::Red
                 [System.Windows.MessageBox]::Show($_.Exception.Message, "Scan Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
-        } finally {
-            $ps.Dispose(); $runspace.Close()
+            } finally {
+                $ps.Dispose(); $runspace.Close()
+                Write-DebugLog "Disposed runspace and PS."
+            }
+            return
         }
-        return
-        }
-        $phase = $progressSync.Phase
-        $c = $progressSync.Count; $t = $progressSync.Total
         if ($phase -match "Step 4" -and $t -gt 0) {
             $statusText.Text = "$phase ($c / $t)"
         } else {
@@ -262,6 +299,7 @@ $scanButton.Add_Click({
         }
     })
     $timer.Start()
+    Write-DebugLog "Timer started. Debug log: $script:DebugLogPath"
 })
 
 # Open selected file in Git Version Picker
@@ -290,6 +328,7 @@ $openVersionPickerButton.Add_Click({
 # Refresh: re-scan current folder (reuses same async scan as Scan button)
 $refreshButton.Add_Click({
     $folder = $folderPathBox.Text.Trim()
+    Write-DebugLog "Refresh clicked. Folder: [$folder]"
     if (-not [System.IO.Directory]::Exists($folder)) {
         [System.Windows.MessageBox]::Show("Folder does not exist: $folder", "Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
         return
@@ -302,6 +341,7 @@ $refreshButton.Add_Click({
     $runspace.Open()
     $runspace.SessionStateProxy.Path.SetLocation($folder) | Out-Null
     $runspace.SessionStateProxy.SetVariable("RootPath", $folder)
+    $runspace.SessionStateProxy.SetVariable("DebugLogPath", $script:DebugLogPath)
     $runspace.SessionStateProxy.SetVariable("UAssetMagicBytes", $script:UAssetMagicBytes)
     $runspace.SessionStateProxy.SetVariable("ConflictMarkerHead", $script:ConflictMarkerHead)
     $runspace.SessionStateProxy.SetVariable("ConflictMarkerSep", $script:ConflictMarkerSep)
@@ -311,6 +351,8 @@ $refreshButton.Add_Click({
     $runspace.SessionStateProxy.SetVariable("LogPath", $script:ScanLogPath)
     $runspace.SessionStateProxy.SetVariable("GrepPath", $script:GrepPath)
     $scriptBlock = {
+        function DLog { param([string]$Msg) if ($DebugLogPath) { try { Add-Content -LiteralPath $DebugLogPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [RS] $Msg" -ErrorAction Stop } catch { } } }
+        DLog "Runspace script started (Refresh). RootPath=$RootPath"
         function Find-BytesInBuffer { param([byte[]]$Buffer,[byte[]]$Search)
             if ($null -eq $Buffer -or $null -eq $Search -or $Search.Length -eq 0 -or $Buffer.Length -lt $Search.Length) { return $false }
             for ($i = 0; $i -le ($Buffer.Length - $Search.Length); $i++) {
@@ -350,12 +392,14 @@ $refreshButton.Add_Click({
             for ($i = 0; $i -lt $UAssetMagicBytes.Length; $i++) { if ($Header[$i] -ne $UAssetMagicBytes[$i]) { return $false } }
             return $true
         }
-        $ProgressSync.Phase = "Step 2: Finding git root..."
-        $gitRoot = $null
-        try { Push-Location $RootPath; $gitRoot = (git rev-parse --show-toplevel 2>$null); Pop-Location } catch { Pop-Location -ErrorAction SilentlyContinue }
-        $ProgressSync.Phase = "Step 3: Enumerating .uasset files (under 3KB)..."
+        $ProgressSync.Phase = "Step 2: Resolving path and finding git root..."
         $rootAbs = [System.IO.Path]::GetFullPath($RootPath)
-        $files = @(Get-ChildItem -Path $RootPath -Filter "*.uasset" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\Intermediate\\' -and $_.FullName -notmatch '\\Saved\\' -and $_.Length -le $MaxUAssetSizeBytes })
+        DLog "rootAbs=$rootAbs"
+        $gitRoot = $null
+        try { Push-Location -LiteralPath $rootAbs; $gitRoot = (git rev-parse --show-toplevel 2>$null); Pop-Location } catch { Pop-Location -ErrorAction SilentlyContinue }
+        $ProgressSync.Phase = "Step 3: Enumerating .uasset files recursively (under 3KB)..."
+        $files = @(Get-ChildItem -LiteralPath $rootAbs -Filter "*.uasset" -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\Intermediate\\' -and $_.FullName -notmatch '\\Saved\\' -and $_.Length -le $MaxUAssetSizeBytes })
+        DLog "files.Count=$($files.Count)"
         $ProgressSync.Phase = "Step 4: Scanning files..."
         $ProgressSync.Total = $files.Count
         $ProgressSync.Count = 0
@@ -393,6 +437,7 @@ $refreshButton.Add_Click({
             $ProgressSync.Count = $results.Count
         }
         if ($logWriter) { try { $logWriter.WriteLine("Scan finished at $(Get-Date -Format 'o')"); $logWriter.Close(); $logWriter.Dispose() } catch { } }
+        DLog "Runspace done (Refresh). results.Count=$($results.Count)"
         return @(,$results), ($results | Where-Object Deformed).Count, (@($files).Count)
     }
     $ps = [powershell]::Create().AddScript($scriptBlock)
@@ -401,15 +446,29 @@ $refreshButton.Add_Click({
     $timer = New-Object System.Windows.Threading.DispatcherTimer
     $timer.Interval = [TimeSpan]::FromMilliseconds(200)
     $timer.Add_Tick({
+        $phase = $progressSync.Phase
+        $c = $progressSync.Count; $t = $progressSync.Total
+        Write-DebugLog "Tick(Refresh): IsCompleted=$($async.IsCompleted) Phase=$phase Count=$c Total=$t"
         if ($async.IsCompleted) {
             $timer.Stop()
+            Write-DebugLog "Refresh async completed, calling EndInvoke..."
             try {
                 $output = $ps.EndInvoke($async)
                 $resultsGrid.ItemsSource = $output[0]
+                $totalCount = $output[2]
+                $deformedCount = $output[1]
+                Write-DebugLog "Refresh EndInvoke OK. totalCount=$totalCount deformedCount=$deformedCount"
                 $logNote = if ($script:ScanLogPath -and (Test-Path -LiteralPath $script:ScanLogPath)) { " Log: $script:ScanLogPath" } else { "" }
-                $statusText.Text = "Step 5: Done. Found $($output[2]) .uasset file(s) under 3KB. Deformed: $($output[1])$logNote"
-                $statusText.Foreground = if ($output[1] -gt 0) { [System.Windows.Media.Brushes]::Red } else { [System.Windows.Media.Brushes]::Green }
+                if ($totalCount -eq 0) {
+                    $statusText.Text = "Done. No .uasset files (under 3KB) found. Folder was searched recursively.$logNote"
+                    $statusText.Foreground = [System.Windows.Media.Brushes]::Gray
+                    [System.Windows.MessageBox]::Show("Scan complete. No .uasset files (under 3KB) were found in the selected folder or its subfolders. Only files under 3KB are scanned.", "Nothing found", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+                } else {
+                    $statusText.Text = "Step 5: Done. Found $totalCount .uasset file(s) under 3KB (searched recursively). Deformed: $deformedCount$logNote"
+                    $statusText.Foreground = if ($deformedCount -gt 0) { [System.Windows.Media.Brushes]::Red } else { [System.Windows.Media.Brushes]::Green }
+                }
             } catch {
+                Write-DebugLog "Refresh EndInvoke threw: $($_.Exception.Message)"
                 $statusText.Text = "Scan failed."
                 $statusText.Foreground = [System.Windows.Media.Brushes]::Red
                 [System.Windows.MessageBox]::Show($_.Exception.Message, "Scan Error", [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
@@ -418,8 +477,6 @@ $refreshButton.Add_Click({
             }
             return
         }
-        $phase = $progressSync.Phase
-        $c = $progressSync.Count; $t = $progressSync.Total
         if ($phase -match "Step 4" -and $t -gt 0) {
             $statusText.Text = "$phase ($c / $t)"
         } else {
@@ -427,6 +484,7 @@ $refreshButton.Add_Click({
         }
     })
     $timer.Start()
+    Write-DebugLog "Refresh timer started."
 })
 
 # Start the application (reuse existing Application if script is run again in same process)
